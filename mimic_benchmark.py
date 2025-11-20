@@ -4,6 +4,9 @@
 import os
 import pandas as pd
 import numpy as np
+import warnings
+import torch
+
 from scipy import optimize
 
 import time
@@ -36,15 +39,11 @@ from catboost import CatBoostClassifier
 
 from sklearn.neural_network import MLPClassifier
 
-import torch
-
-import logging
 import traceback
 import json
 from datetime import datetime
 
-
-#from tabpfn_extensions.rf_pfn import RandomForestTabPFNClassifier
+from hpo_grid import PARAM_GRIDS
 
 #from tabpfn_extensions import TabPFNClassifier
 
@@ -56,24 +55,25 @@ if not torch.cuda.is_available():
         "GPU device not found. For fast training, please enable GPU. See section above for instructions."
     )
 
-import warnings
-
 warnings.filterwarnings("ignore") 
 
 LOG_FILE = "boosting_failures.log"
 LOG_FILE_CALIB = "calibration_failures.log"
 
 
-mimic_3 = pd.read_csv("mimic_3_processed_251107.csv")
-
 NJOBS = -1 
 NJOBS_GS = 1
 N_TRAINING_SAMPLE = -1
+HPO = True
 
 print(NJOBS)   
 print(N_TRAINING_SAMPLE)
 
 RANDOM_STATE = 42
+
+
+CACHE_DIR = os.path.join("results", "cache")
+memory = Memory(CACHE_DIR, verbose=0)
 
 
 def stable_hash(s: str) -> int:
@@ -94,9 +94,6 @@ def set_random_seed(test_name, noise_level, fold_idx, base_seed=RANDOM_STATE):
     seed = abs(stable_hash(combined)) % (2**32)
     return int(seed)
 
-
-CACHE_DIR = os.path.join("results", "cache")
-memory = Memory(CACHE_DIR, verbose=0)
 
 cont_features = [
     "age",
@@ -121,109 +118,10 @@ cont_features = [
     #    'pao2fio2_vent_min', 'bilirubin_min', 'bilirubin_max',
 ]
 
-param_grids = {
-    'Logistic': {
-        'lr__penalty': [None],
-    },
+param_grids = PARAM_GRIDS if HPO else {}
 
-    'LASSO': { ## from https://arxiv.org/pdf/2505.14415
-        'lr__penalty': ["l1"],
-        'lr__solver': ["liblinear"],
-        'lr__C': [0.01, 0.1, 1, 10, 100],
-    },
 
-    'Ridge': { ## from https://arxiv.org/pdf/2505.14415
-        'lr__penalty': ['l2'],
-        'lr__C': [0.01, 0.1, 1, 10, 100],
-    },
-
-    'Random Forest':{ ## from https://arxiv.org/pdf/2505.14415 
-        'n_estimators': np.arange(50,300, 50), # randint(50,250),
-        'max_depth': [None, 2, 3, 4],
-        'max_features': ["sqrt","log2",None, 0.2, 0.4, 0.6, 0.8], # ["sqrt","log2",None, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
-        'min_samples_leaf': list(np.round(np.logspace(np.log10(1.5), np.log10(50.5), num=5).astype(int))), # loguniform(1.5, 50.5),
-        'bootstrap': [True, False],
-        'min_impurity_decrease': [0, 0.01, 0.02, 0.05],
-        'n_jobs': [1],
-    },
-
-    'Gradient Boosting': {  ## from https://arxiv.org/pdf/2207.08815
-        'gb__learning_rate': list((np.round(np.logspace(np.log10(1e-5), np.log10(1), num=6),5))), # lognorm(np.log(0.01), np.log(10)), 
-        'gb__subsample': [0.5, 0.8, 1], # uniform(0.5, 1),
-        'gb__n_estimators': [1000], # loguniform_int(10.5, 1000.5),
-        'gb__max_depth': [None, 2, 3, 4, 5], #(with weight = (0.1, 0.1, 0.6, 0.1, 0.1))
-        'gb__min_samples_split': [2, 3], #(with weight = (0.95, 0.05))
-        'gb__min_samples_leaf': list(np.round(np.logspace(np.log10(1.5), np.log10(50.5), num=5).astype(int))), # loguniform_int(1.5, 50.5),
-        'gb__min_impurity_decrease': [0, 0.01, 0.02, 0.05], #(with weight = (0.85, 0.5, 0.5, 0.5)
-        'gb__max_leaf_nodes': [None, 5, 10, 15], #(with weight =(0.85, 0.5, 0.5, 0.5)),
-        'gb__validation_fraction': [0.1],
-        'gb__n_iter_no_change': [50],
-    },
-
-    'XGBoost': {  ## from https://arxiv.org/pdf/2505.14415
-        'n_estimators': [1000],
-        'max_depth': np.arange(2,11,2), # randint(2,10),
-        'learning_rate': list((np.round(np.logspace(np.log10(1e-5), np.log10(1), num=6),5))), #loguniform(0.00001, 1),
-        'min_child_weight': list((np.round(np.logspace(np.log10(1), np.log10(100), num=6),5))), #loguniform(1, 100),
-        'subsample': [0.5, 0.8, 1], #uniform(0.5, 1),
-        'colsample_bylevel': [0.5, 0.8, 1],# uniform(0.5, 1),
-        'colsample_bytree': [0.5, 0.8, 1], # uniform(0.5, 1),
-        'gamma': list((np.round(np.logspace(np.log10(1e-8), np.log10(7), num=6),5))), #loguniform(0.00000001, 7),
-        'lambda': list((np.round(np.logspace(np.log10(1), np.log10(4), num=4),3))), # loguniform(1, 4),
-        'alpha': list((np.round(np.logspace(np.log10(1e-8), np.log10(100), num=5),7))), # loguniform(0.00000001, 100),
-        'early_stopping_rounds': [50], # doesn't work for cross validation, early stopping rounds is more suited of train/val/test split
-    #   'verbose': [False],   
-    #   'tree_method': ['hist'],
-    #   'device': ['cuda']
-    },
-
-    'LightGBM':{ ## from https://arxiv.org/pdf/2407.04491
-        'n_estimators': [1000],
-        'bagging_freq': [1],
-        'num_leaves':  [2, 10, 100, 1000, 10000], #list((np.round(np.logspace(np.log10(1), np.log10(1e5), num=6).astype(int)))), # loguniform_int(1,np.exp(1)**7), the documentation says that the number of leaves is bounded by 131072
-        'learning_rate': list((np.round(np.logspace(np.log10(1e-5), np.log10(1), num=6),5))), # loguniform(np.exp(1)**(-7), 1), in the paper the lower bound is 1e-7 but for consistency with the other boosting method we take 1e-5
-        'subsample': [0.5, 0.8, 1], # uniform(0.5, 1),
-        'feature_fraction': [0.5, 0.8, 1], # uniform(0.5, 1),
-        'min_data_in_leaf': list((np.round(np.logspace(np.log10(1), np.log10(1e5), num=6).astype(int)))), # loguniform_int(1, np.exp(1)**6),
-        'min_sum_hessian_in_leaf': list(np.logspace(np.log10(1e-16), np.log10(1e5), num=5)), # oguniform(np.exp(1)**(-16), np.exp(1)**5),
-        'lambda_l1': [0, 1e-16, 1e-10, 0.0001, 100.0],
-        'lambda_l2': [0, 1e-16, 1e-10, 0.0001, 100.0],
-        'verbose': [-1],
-        'objective': ['binary'],
-        'metric': ['auc'],
-       # 'device':['gpu'],
-        #'early_stopping_rounds': [300], # doesn't work for cross validation, early stopping rounds is more suited of train/val/test split
-
-    },
-
-    'CatBoost':{ ## from https://arxiv.org/pdf/2505.14415
-        'iterations': [1000],
-        'depth': np.arange(2,7,2), # randint(2,6),
-        'learning_rate': list((np.round(np.logspace(np.log10(1e-5), np.log10(1), num=6),5))), # loguniform(0.00001, 1),
-        'bagging_temperature': [0, 0.25, 0.5, 0.75, 1], # uniform(0,1),
-        'l2_leaf_reg':  list((np.round(np.logspace(np.log10(1), np.log10(10), num=4),1))), # loguniform(1 ,10),
-        'one_hot_max_size': [0, 5, 15, 25], # randint(0, 25),
-        'random_strength': [1, 10, 20], # randint(1, 20),
-        'leaf_estimation_iterations': [1, 10, 20], # randint(1, 20),
-        'od_wait': [50], # doesn't work for cross validation, early stopping rounds is more suited of train/val/test split
-        'od_type': ['Iter'], # doesn't work for cross validation, early stopping rounds is more suited of train/val/test split
-        'verbose': [1],
-        'eval_metric': ['AUC'],
-#        'task_type': ["GPU"]
-
-    },
-
-    'MLP':{
-        'mlp__hidden_layer_sizes': [(50), (100), (200)],
-        'mlp__activation':['logistic', 'tanh', 'relu'],
-        'mlp__learning_rate_init': list((np.round(np.logspace(np.log10(1e-5), np.log10(1), num=6),5))),
-        'mlp__early_stopping':[True],
-        'mlp__validation_fraction':[0.1],
-        'mlp__n_iter_no_change':[50],
-    }
-
-}
-#param_grids = {}
+mimic_3 = pd.read_csv("mimic_3_processed_251107.csv")
 
 cat_features = ["aids", "hem", "mets", "admissiontype"]
 
@@ -231,7 +129,6 @@ features = cont_features + cat_features
 
 outcome = ["hospital_mortality"]
 
-socio_demographic = ["insurance", "marital_status", "ethnicity", "language", "gender"]
 
 X = mimic_3[features]
 y = mimic_3["hospital_mortality"]
@@ -521,7 +418,7 @@ def grid_step(model_name, X_tr, y_tr, cv_inner, param_grid):
         elif model_name == 'CatBoost':
             model_step = CatBoostClassifier()
             model_step.set_params(**param_grid)
-            model_step.fit(X_tr_fold, y_tr_fold, eval_set=[(X_early_stop, y_early_stop)], verbose=False)
+            model_step.fit(X_tr_fold, y_tr_fold, eval_set=[(X_early_stop, y_early_stop)], verbose=True)
             score = roc_auc_score(y_val, model_step.predict_proba(X_val)[:, 1])
             aucs.append(score)
 
@@ -550,42 +447,25 @@ preprocessor_2 = ColumnTransformer(
 )
 
 
-'''
-clf_base = TabPFNClassifier(
-    ignore_pretraining_limits=True,
-    inference_config={
-        "SUBSAMPLE_SAMPLES": 10000
-    },  # Needs to be set low so that not OOM on fitting intermediate nodes
-)
-
-
-tabpfn_tree_clf = RandomForestTabPFNClassifier(
-    tabpfn=clf_base,
-    verbose=0,
-    max_predict_time=60,  # Will fit for one minute
-    fit_nodes=True,  # Wheather or not to fit intermediate nodes
-    adaptive_tree=True,  # Whather or not to validate if adding a leaf helps or not
-    show_progress=True,
-)
-'''
 
 models = {
     # Linear method
     "Logistic": Pipeline([("preprocessor", preprocessor_1), ("lr", LogisticRegression(penalty=None))], memory=memory),
     "LASSO": Pipeline([("preprocessor", preprocessor_1),("lr", LogisticRegression(penalty="l1", solver="liblinear")),], memory=memory),
     "Ridge": Pipeline([("preprocessor", preprocessor_1),("lr", LogisticRegression(penalty="l2")),], memory=memory),
+
     # Tree-based methods
     "Random Forest": RandomForestClassifier(n_jobs=1),
     ## Boosting    
     "Gradient Boosting": Pipeline([("preprocessor", preprocessor_2), ("gb", GradientBoostingClassifier())], memory=memory),
     "XGBoost": XGBClassifier(),
     "LightGBM": LGBMClassifier(),
-    "CatBoost": CatBoostClassifier(verbose=0),
+    "CatBoost": CatBoostClassifier(verbose=1),
+
     # Deep learning
     "MLP": Pipeline([("preprocessor", preprocessor_1), ("mlp", MLPClassifier(max_iter=500))], memory=memory),
     ## Transformers
     #"TabPFN": TabPFNClassifier(),
-#    "TabPFN RF": tabpfn_tree_clf,  ## for more than 10k (training) samples
 #    "TabICL": TabICLClassifier(),
 }
 

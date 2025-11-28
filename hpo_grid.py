@@ -72,7 +72,7 @@ PARAM_GRIDS = {
         'subsample': [0.5, 0.8, 1], # uniform(0.5, 1),
         'feature_fraction': [0.5, 0.8, 1], # uniform(0.5, 1),
         'min_data_in_leaf': list((np.round(np.logspace(np.log10(1), np.log10(1e5), num=6).astype(int)))), # loguniform_int(1, np.exp(1)**6),
-        'min_sum_hessian_in_leaf': list(np.logspace(np.log10(1e-16), np.log10(1e5), num=5)), # oguniform(np.exp(1)**(-16), np.exp(1)**5),
+        'min_sum_hessian_in_leaf': list(np.logspace(np.log10(1e-7), np.log10(1e5), num=5)), ## old: list(np.logspace(np.log10(1e-16), np.log10(1e5), num=5)), # oguniform(np.exp(1)**(-16), np.exp(1)**5),
         'lambda_l1': [0, 1e-16, 1e-10, 0.0001, 100.0],
         'lambda_l2': [0, 1e-16, 1e-10, 0.0001, 100.0],
         'verbose': [-1],

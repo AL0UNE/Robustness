@@ -24,9 +24,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import SimpleImputer, IterativeImputer
+from sklearn.frozen import FrozenEstimator
+from sklearn.calibration import CalibratedClassifierCV
 import gc
 
 from sklearn.linear_model import LogisticRegression
+
 from sklearn.neural_network import MLPClassifier
 
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
@@ -54,15 +57,15 @@ if not torch.cuda.is_available():
 
 warnings.filterwarnings("ignore") 
 
-LOG_FILE = "boosting_failures_251121.log"
+LOG_FILE = "boosting_failures_251211.log"
 LOG_FILE_CALIB = "calibration_failures.log"
 
 
 NJOBS = -1
 NJOBS_GS = 1
 N_TRAINING_SAMPLE = -1 ## No need to change it since we do not have to run the xp for 10k
-HPO = True
-N_SEARCH_GS = 30
+HPO = False
+N_SEARCH_GS = 15
 
 print(f'N_JOBS: {NJOBS}')   
 print(f'N_TRAINING_SAMPLE: {N_TRAINING_SAMPLE}')
@@ -354,7 +357,7 @@ def fit_intercepts(X, coeffs, p, self_mask=False):
 def tune_model(model_name, model, X_train, y_train, random_state=None):
     if model_name not in param_grids:
         model.fit(X_train, y_train)
-        return model, None
+        return model, {}
 
     cv_inner = KFold(n_splits=3, shuffle=True, random_state=random_state)
     param_dist = param_grids[model_name]
@@ -388,13 +391,33 @@ def tune_model(model_name, model, X_train, y_train, random_state=None):
                 best_auc = score
                 best_params = params
                 best_model = model_step
+        if best_params is None:
+            print(f"All hyperparameter combinations failed for {model_name}. Using default parameters.")
+            model.fit(X_train, y_train)
+            return model, {}
+        print(f"Best params for {model_name}: {best_params}")
+        
+        X_train_refit, X_early_stop, y_train_refit, y_early_stop = train_test_split(
+            X_train, y_train, test_size=0.1, stratify=y_train, random_state=RANDOM_STATE)
 
 #        print(f"Best params for {model_name}: {best_params}, Best iteration: {best_model.best_iteration}")
-        if model_name in ['LightGBM', "XGBoost"]:
-            best_params['model_n_iter'] = best_model.best_iteration
-        if model_name == 'CatBoost':
-            best_params['model_n_iter'] = best_model.get_best_iteration()
-        return best_model, best_params
+        if model_name =='LightGBM':
+            final_model = LGBMClassifier(**best_params)
+            final_model.fit(X_train_refit, y_train_refit, eval_set=[(X_early_stop, y_early_stop)], callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)])
+            best_params['model_n_iter'] = final_model.best_iteration_
+        elif model_name == 'XGBoost':
+            final_model = XGBClassifier(**best_params)
+            final_model.fit(X_train_refit, y_train_refit, eval_set=[(X_early_stop, y_early_stop)], verbose=False)
+            best_params['model_n_iter'] = final_model.best_iteration
+        elif model_name == 'CatBoost':
+            final_model = CatBoostClassifier(**best_params)
+            final_model.fit(X_train_refit, y_train_refit, eval_set=[(X_early_stop, y_early_stop)], verbose=True)
+            best_params['model_n_iter'] = final_model.get_best_iteration()
+        else:
+            final_model = best_model
+            final_model.fit(X_train, y_train)
+        return final_model, best_params
+
  
 def grid_step(model_name, X_tr, y_tr, cv_inner, param_grid):
     aucs = []
@@ -478,12 +501,11 @@ models_name = list(models.keys())
 
 n_models = len(models_name)
 
-directory_name = "results_251121"
+directory_name = "results_no_hpo"
 create_directory(directory_name)
 
 
 ## Robustness tests
-
 """### Label noise
 """
 random_label_noise_levels = np.linspace(0, 1, 11)
@@ -506,6 +528,7 @@ def label_noise(
     X_train, X_val = X.loc[train_idx], X.loc[val_idx]
     y_train, y_val = y.loc[train_idx], y.loc[val_idx]
     y_proxy_train = y_proxy.loc[train_idx]
+    
     ## limit training to 10k samples
     if N_TRAINING_SAMPLE > 0:
         n_samples = np.min([len(X_train), N_TRAINING_SAMPLE])
@@ -540,7 +563,7 @@ def label_noise(
     elif noise_type == "conditional":
         age_train_perc = X_train.age.rank(pct=True)
         swap_by_age = rng.binomial(1, p=age_train_perc**noise_level, size=len(age_train_perc))
-        y_train_noisy = y_train_noisy * (swap_by_age) + (1 - y_train_noisy) * (1 - swap_by_age)
+        y_train_noisy = y_train_noisy * (1-swap_by_age) + (1 - y_train_noisy) * (swap_by_age)
     elif noise_type == "proxy":
         y_train_noisy = y_train_noisy * (1 - noise_level) + y_proxy_train * noise_level
 
@@ -550,6 +573,10 @@ def label_noise(
     end = time.time()
     train_fit_time = end - start
 
+    X_val, X_cal, y_val, y_cal = train_test_split(X_val, y_val, test_size=0.1, stratify=y_val, random_state=RANDOM_STATE)
+    calibrated_clf = CalibratedClassifierCV(FrozenEstimator(tuned_model))
+    calibrated_clf.fit(X_cal, y_cal)
+    tuned_model = calibrated_clf
     start = time.time()
     y_pred = predict_proba_batched(tuned_model, X_val)
     end = time.time()
@@ -568,6 +595,9 @@ def label_noise(
 
 
     prob_true, prob_pred = calibration_curve(y_val, y_pred)
+
+    del tuned_model, calibrated_clf
+    gc.collect()
 
     return (
         model_name,
@@ -601,7 +631,6 @@ results_random_label_noise = Parallel(n_jobs=NJOBS, verbose=0)(
 save_results(
     results_random_label_noise, directory, n_folds, test_name="RANDOM_LABEL_NOISE"
 )
-
 results_label_noise_01 = Parallel(n_jobs=NJOBS, verbose=0)(
     delayed(label_noise)(
         model_name, model, noise_level, train_idx, val_idx, fold_idx, noise_type="0to1"
@@ -729,6 +758,11 @@ def input_noise(
     end = time.time()
     train_fit_time = end - start
 
+    X_val, X_cal, y_val, y_cal = train_test_split(X_val, y_val, test_size=0.1, stratify=y_val, random_state=RANDOM_STATE)
+    calibrated_clf = CalibratedClassifierCV(FrozenEstimator(tuned_model))
+    calibrated_clf.fit(X_cal, y_cal)
+    tuned_model = calibrated_clf
+
     start = time.time()
     y_pred = predict_proba_batched(tuned_model, X_val)
     end = time.time()
@@ -745,6 +779,9 @@ def input_noise(
         error_msg = traceback.format_exc()
 
     prob_true, prob_pred = calibration_curve(y_val, y_pred)
+
+    del tuned_model, calibrated_clf
+    gc.collect()
 
     return (
         model_name,
@@ -938,11 +975,17 @@ def imbalance_data(model_name, model, imbalance_ratio, train_idx, val_idx):
         y_train_balanced = y_train_balanced.loc[idx]
 
 
+    seed = set_random_seed("imbalance", imbalance_ratio, 0, base_seed=RANDOM_STATE)
 
     start = time.time()
-    tuned_model, best_params = tune_model(model_name, model, X_train_balanced, y_train_balanced)
+    tuned_model, best_params = tune_model(model_name, model, X_train_balanced, y_train_balanced, random_state=seed)
     end = time.time()
     train_fit_time = end - start
+
+    X_val, X_cal, y_val, y_cal = train_test_split(X_val, y_val, test_size=0.1, stratify=y_val, random_state=RANDOM_STATE)
+    calibrated_clf = CalibratedClassifierCV(FrozenEstimator(tuned_model))
+    calibrated_clf.fit(X_cal, y_cal)
+    tuned_model = calibrated_clf
 
     start = time.time()
     y_pred = predict_proba_batched(tuned_model, X_val)
@@ -960,6 +1003,9 @@ def imbalance_data(model_name, model, imbalance_ratio, train_idx, val_idx):
         error_msg = traceback.format_exc()
 
     prob_true, prob_pred = calibration_curve(y_val, y_pred)
+
+    del tuned_model, calibrated_clf
+    gc.collect()
 
     return (
         model_name,
@@ -1015,13 +1061,20 @@ def training_data_regime(model_name, model, training_size, train_idx, val_idx):
     
 
 
+    seed = set_random_seed("training", training_size, 0, base_seed=RANDOM_STATE)
+
 
     start = time.time()
-    tuned_model, best_params = tune_model(model_name, model, X_train_sampled, y_train_sampled)
+    tuned_model, best_params = tune_model(model_name, model, X_train_sampled, y_train_sampled, random_state=seed)
     end = time.time()
     train_fit_time = end - start
 
     ## calibration here
+
+    X_val, X_cal, y_val, y_cal = train_test_split(X_val, y_val, test_size=0.1, stratify=y_val, random_state=RANDOM_STATE)
+    calibrated_clf = CalibratedClassifierCV(FrozenEstimator(tuned_model))
+    calibrated_clf.fit(X_cal, y_cal)
+    tuned_model = calibrated_clf
 
     start = time.time()
     y_pred = predict_proba_batched(tuned_model, X_val)
@@ -1039,6 +1092,9 @@ def training_data_regime(model_name, model, training_size, train_idx, val_idx):
         error_msg = traceback.format_exc()
 
     prob_true, prob_pred = calibration_curve(y_val, y_pred)
+
+    del tuned_model, calibrated_clf
+    gc.collect()
 
     return (
         model_name,
@@ -1123,6 +1179,11 @@ def permutation_features(
     end = time.time()
     train_fit_time = end - start
 
+    X_val, X_cal, y_val, y_cal = train_test_split(X_val, y_val, test_size=0.1, stratify=y_val, random_state=RANDOM_STATE)
+    calibrated_clf = CalibratedClassifierCV(FrozenEstimator(tuned_model))
+    calibrated_clf.fit(X_cal, y_cal)
+    tuned_model = calibrated_clf
+
     start = time.time()
     y_pred = predict_proba_batched(tuned_model, X_val)
     end = time.time()
@@ -1139,6 +1200,9 @@ def permutation_features(
         error_msg = traceback.format_exc()
 
     prob_true, prob_pred = calibration_curve(y_val, y_pred)
+
+    del tuned_model, calibrated_clf
+    gc.collect()
 
     return (
         model_name,
@@ -1196,6 +1260,276 @@ save_results(
 
 print("SHUFFLE NOISE OVER")
 
+"""### Missing data
+
+"""
+
+directory = f"{directory_name}/missing_data/"
+create_directory(directory)
+
+missing_ratio = np.linspace(0.1, 1, 9, endpoint=False)
+
+def add_missingness(X_noisy, noise_level, mechanism="MCAR", prop_cond_features=0.5):
+    size = X_noisy.shape
+    mask = None
+
+    if mechanism == "MCAR":
+        mask = np.random.rand(*size) < noise_level
+
+    elif mechanism == "MAR":
+        X_float = X_noisy.astype(np.float32).values
+        # can't create rng here because we need caller's seed to be used; caller
+        # should call MAR_mask directly with rng/torch_gen when determinism is
+        # required. For backwards compatibility, fall back to MAR_mask default.
+        mask = MAR_mask(X_float, p=noise_level, p_obs=prop_cond_features)
+
+    elif mechanism == "MNAR":
+        X_float = X_noisy.astype(np.float32).values
+        mask = MNAR_self_mask_logistic(X_float, noise_level)
+
+    if mask is None: 
+        print("DEBUG : EMPTY MASK") 
+    return mask
+
+
+def missing_data(
+    model_name,
+    model,
+    noise_level,
+    train_idx,
+    val_idx,
+    fold_idx,
+    which_set="Train",
+    mechanism="MNAR",
+):
+
+    X_train, X_val = X.loc[train_idx], X.loc[val_idx]
+    y_train, y_val = y.loc[train_idx], y.loc[val_idx]
+
+
+    if N_TRAINING_SAMPLE > 0:
+        n_samples = np.min([len(X_train), N_TRAINING_SAMPLE])
+        idx = X_train.sample(n_samples, random_state=RANDOM_STATE).index
+        X_train  = X_train.loc[idx] 
+        y_train = y_train.loc[idx]
+
+
+    if which_set == "Train":
+        #if not(model_name == "TabICL" or mechanism == "MAR") and noise_level >= 0.6 :
+        #    print(f"Skipping {model_name} with noise level {noise_level} as it is too high for TabPfn")
+        #    return (
+        #        model_name,
+        #        noise_level,
+        #        None,
+        #        None,
+        #        [None] * 5,
+        #        [None] * 5,
+        #        None,
+        #        None
+        #    )       
+        X_noisy = X_train.copy()
+        X_noisy[cont_features] = X_noisy[cont_features].fillna(X_train[cont_features].mean()) ## imputation is required to create the MAR and MNAR masks
+        X_noisy[cat_features] = X_noisy[cat_features].fillna(X_train[cat_features].mode().loc[0])
+        seed = set_random_seed(which_set+mechanism, noise_level, fold_idx, base_seed=RANDOM_STATE)
+        rng = np.random.default_rng(seed)
+        torch_gen = torch.Generator()
+        torch_gen.manual_seed(seed)
+        size = X_noisy.shape
+        mask = (
+            MAR_mask(X_noisy.astype(np.float32).values, p=noise_level, p_obs=0.5, rng=rng, torch_gen=torch_gen)
+            if mechanism == "MAR"
+            else (MNAR_self_mask_logistic(X_noisy.astype(np.float32).values, noise_level, rng=rng, torch_gen=torch_gen) if mechanism == "MNAR" else (rng.random(size) < noise_level))
+        )
+        X_train = X_noisy.mask(mask, np.nan)
+    if which_set == "Val":
+        X_noisy = X_val.copy()
+        X_noisy[cont_features] = X_noisy[cont_features].fillna(X_train[cont_features].mean()) ## imputation is required to create the MAR and MNAR masks
+        X_noisy[cat_features] = X_noisy[cat_features].fillna(X_train[cat_features].mode().loc[0])
+        seed = set_random_seed(which_set+mechanism, noise_level, fold_idx, base_seed=RANDOM_STATE)
+        rng = np.random.default_rng(seed)
+        torch_gen = torch.Generator()
+        torch_gen.manual_seed(seed)
+        size = X_noisy.shape
+        mask = (
+            MAR_mask(X_noisy.astype(np.float32).values, p=noise_level, p_obs=0.5, rng=rng, torch_gen=torch_gen)
+            if mechanism == "MAR"
+            else (MNAR_self_mask_logistic(X_noisy.astype(np.float32).values, noise_level, rng=rng, torch_gen=torch_gen) if mechanism == "MNAR" else (rng.random(size) < noise_level))
+        )
+        X_val = X_noisy.mask(mask, np.nan)
+    if which_set == "Train_Val":
+        #if not(model_name == "TabICL" or mechanism == "MAR") and noise_level >= 0.6 :
+        #    print(f"Skipping {model_name} with noise level {noise_level} as it is too high for TabPfn")
+        #    return (
+        #        model_name,
+        #        noise_level,
+        #        None,
+        #        None,
+        #        [None] * 5,
+        #        [None] * 5,
+        #        None,
+        #        None
+        #    )   
+
+        X_noisy = pd.concat([X_train, X_val]).copy()
+        X_noisy[cont_features] = X_noisy[cont_features].fillna(X_train[cont_features].mean()) ## imputation is required to create the MAR and MNAR masks
+        X_noisy[cat_features] = X_noisy[cat_features].fillna(X_train[cat_features].mode().loc[0])
+        seed = set_random_seed(which_set+mechanism, noise_level, fold_idx, base_seed=RANDOM_STATE)
+        rng = np.random.default_rng(seed)
+        torch_gen = torch.Generator()
+        torch_gen.manual_seed(seed)
+        size = X_noisy.shape
+        mask = (
+            MAR_mask(X_noisy.astype(np.float32).values, p=noise_level, p_obs=0.5, rng=rng, torch_gen=torch_gen)
+            if mechanism == "MAR"
+            else (MNAR_self_mask_logistic(X_noisy.astype(np.float32).values, noise_level, rng=rng, torch_gen=torch_gen) if mechanism == "MNAR" else (rng.random(size) < noise_level))
+        )
+        X_all = X_noisy.mask(mask, np.nan)
+        X_train, X_val = X_all.loc[train_idx], X_all.loc[val_idx] 
+
+
+    start = time.time()
+    #print(f"Debug {model_name}, {model}, {noise_level}")
+    tuned_model, best_params = tune_model(model_name, model, X_train, y_train, random_state=seed)
+    end = time.time()
+    train_fit_time = end - start
+
+    X_val, X_cal, y_val, y_cal = train_test_split(X_val, y_val, test_size=0.1, stratify=y_val, random_state=RANDOM_STATE)
+    calibrated_clf = CalibratedClassifierCV(FrozenEstimator(tuned_model))
+    calibrated_clf.fit(X_cal, y_cal)
+    tuned_model = calibrated_clf
+
+    start = time.time()
+    y_pred = predict_proba_batched(tuned_model, X_val)
+    end = time.time()
+    test_pred_time = end - start
+
+
+    ## calibration slope/intercept
+    intercept, slope = None, None
+    try:
+        logits = special.logit(y_pred)
+        calib_model = LogisticRegression(penalty=None, max_iter=500)
+        calib_model.fit(logits.reshape(-1, 1),y_val)
+        intercept, slope = calib_model.intercept_[0], calib_model.coef_[0][0]
+    except Exception as e:
+        error_msg = traceback.format_exc()
+
+    prob_true, prob_pred = calibration_curve(y_val, y_pred)
+
+    del tuned_model, calibrated_clf
+    gc.collect()
+
+    return (
+        model_name,
+        noise_level,
+        roc_auc_score(y_score=y_pred, y_true=y_val),
+        brier_score_loss(y_true=y_val, y_proba=y_pred),
+        intercept,
+        slope,
+        prob_true,
+        prob_pred,
+        train_fit_time,
+        test_pred_time,
+        best_params
+    )
+
+results_MCAR_train = Parallel(n_jobs=NJOBS, verbose=1)(
+    delayed(missing_data)(
+        model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Train", mechanism="MCAR"
+    )
+    for model_name, model in models.items()
+    for ratio in missing_ratio
+    for fold_idx, (train_idx, val_idx) in enumerate(splits)
+)
+
+save_results(results_MCAR_train, directory, n_folds, test_name="MCAR_TRAIN")
+
+results_MCAR_val = Parallel(n_jobs=NJOBS, verbose=1)(
+    delayed(missing_data)(model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Val", mechanism="MCAR")
+    for model_name, model in models.items()
+    for ratio in missing_ratio
+    for fold_idx, (train_idx, val_idx) in enumerate(splits)
+)
+
+save_results(results_MCAR_val, directory, n_folds, test_name="MCAR_VAL")
+
+results_MCAR_all = Parallel(n_jobs=NJOBS, verbose=1)(
+    delayed(missing_data)(
+        model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Train_Val", mechanism="MCAR"
+    )
+    for model_name, model in models.items()
+    for ratio in missing_ratio
+    for fold_idx, (train_idx, val_idx) in enumerate(splits)
+)
+
+save_results(results_MCAR_all, directory, n_folds, test_name="MCAR_ALL")
+
+
+results_MAR_train = Parallel(n_jobs=NJOBS, verbose=1)(
+    delayed(missing_data)(
+        model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Train", mechanism="MAR"
+    )
+    for model_name, model in models.items()
+    for ratio in missing_ratio
+    for fold_idx, (train_idx, val_idx) in enumerate(splits)
+)
+
+save_results(results_MAR_train, directory, n_folds, test_name="MAR_TRAIN")
+
+results_MAR_val = Parallel(n_jobs=NJOBS, verbose=1)(
+    delayed(missing_data)(model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Val", mechanism="MAR")
+    for model_name, model in models.items()
+    for ratio in missing_ratio
+    for fold_idx, (train_idx, val_idx) in enumerate(splits)
+)
+
+save_results(results_MAR_val, directory, n_folds, test_name="MAR_VAL")
+
+results_MAR_all = Parallel(n_jobs=NJOBS, verbose=1)(
+    delayed(missing_data)(
+        model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Train_Val", mechanism="MAR"
+        )
+    for model_name, model in models.items()
+    for ratio in missing_ratio
+    for fold_idx, (train_idx, val_idx) in enumerate(splits)
+)
+
+save_results(results_MAR_all, directory, n_folds, test_name="MAR_ALL")
+
+results_MNAR_train = Parallel(n_jobs=NJOBS, verbose=1)(
+    delayed(missing_data)(
+        model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Train"
+    )
+    for model_name, model in models.items()
+    for ratio in missing_ratio
+    for fold_idx, (train_idx, val_idx) in enumerate(splits)
+)
+
+save_results(results_MNAR_train, directory, n_folds, test_name="MNAR_TRAIN")
+
+results_MNAR_val = Parallel(n_jobs=NJOBS, verbose=1)(
+    delayed(missing_data)(model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Val")
+    for model_name, model in models.items()
+    for ratio in missing_ratio
+    for fold_idx, (train_idx, val_idx) in enumerate(splits)
+)
+
+save_results(results_MNAR_val, directory, n_folds, test_name="MNAR_VAL")
+
+results_MNAR_all = Parallel(n_jobs=NJOBS, verbose=1)(
+    delayed(missing_data)(
+        model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Train_Val",
+        )
+    for model_name, model in models.items()
+    for ratio in missing_ratio
+    for fold_idx, (train_idx, val_idx) in enumerate(splits)
+)
+
+save_results(results_MNAR_all, directory, n_folds, test_name="MNAR_ALL")
+
+
+print("MISSING DATA OVER")
+
 """
 ### Subgroup analysis
 """
@@ -1221,8 +1555,11 @@ def subgroup_analysis(model_name, model, train_idx, val_idx, stratify_on="gender
         X_train  = X_train.loc[idx] 
         y_train = y_train.loc[idx]
 
+    seed = set_random_seed("subgroup", stratify_on, 0, base_seed=RANDOM_STATE)
+
+
     start = time.time()
-    tuned_model, best_params = tune_model(model_name, model, X_train, y_train)
+    tuned_model, best_params = tune_model(model_name, model, X_train, y_train, random_state=seed)
     #model.fit(X_train, y_train)
     end = time.time()
     train_fit_time = end - start
@@ -1232,8 +1569,13 @@ def subgroup_analysis(model_name, model, train_idx, val_idx, stratify_on="gender
     for cat in mimic_3[stratify_on].dropna().unique():
         X_val_strat = X_val.loc[mimic_3[stratify_on] == cat]
         y_val_strat = y_val.loc[X_val_strat.index]
+
+        X_val_strat, X_cal, y_val_strat, y_cal = train_test_split(X_val_strat, y_val_strat, test_size=0.1, stratify=y_val_strat, random_state=RANDOM_STATE)
+        calibrated_clf = CalibratedClassifierCV(FrozenEstimator(tuned_model))
+        calibrated_clf.fit(X_cal, y_cal)
+
         start = time.time()
-        y_pred = predict_proba_batched(tuned_model, X_val_strat)
+        y_pred = predict_proba_batched(calibrated_clf, X_val_strat)
         end = time.time()
         test_pred_time = end - start
         ## calibration slope/intercept
@@ -1263,6 +1605,9 @@ def subgroup_analysis(model_name, model, train_idx, val_idx, stratify_on="gender
                 best_params
             ]
         )
+
+    del tuned_model, calibrated_clf
+    gc.collect()
 
     return stratified_perf
 
@@ -1378,23 +1723,30 @@ def train_evaluate(model_name, model, X_train, y_train, df_test, stratify_on="ge
         X_train  = X_train.loc[idx] 
         y_train = y_train.loc[idx]
 
+    seed = set_random_seed("m4", stratify_on, 0, base_seed=RANDOM_STATE)
+
     start = time.time()
-    tuned_model, best_params = tune_model(model_name, model, X_train, y_train)
+    tuned_model, best_params = tune_model(model_name, model, X_train, y_train, random_state=seed)
     #model.fit(X_train, y_train)
     end = time.time()
     train_fit_time = end - start
 
+    X_test, X_cal, y_test, y_cal = train_test_split(df_test, df_test["hospital_mortality"], test_size=0.1, stratify=df_test["hospital_mortality"], random_state=RANDOM_STATE)
+    calibrated_clf = CalibratedClassifierCV(FrozenEstimator(tuned_model))
+    calibrated_clf.fit(X_cal[X_train.columns], y_cal)
+    tuned_model = calibrated_clf
+
     start = time.time()
-    y_pred = predict_proba_batched(tuned_model, df_test[X_train.columns])
+    y_pred = predict_proba_batched(tuned_model, X_test[X_train.columns])
 
     end = time.time()
     test_pred_time = end - start
 
     stratified_perf = []
     if stratify_on is not None:
-        for cat in df_test[stratify_on].dropna().unique():
-            X_eval_strat = df_test.loc[df_test[stratify_on] == cat][X_train.columns]
-            y_eval_strat = df_test.loc[df_test[stratify_on] == cat]["hospital_mortality"]
+        for cat in X_test[stratify_on].dropna().unique():
+            X_eval_strat = X_test.loc[X_test[stratify_on] == cat][X_train.columns]
+            y_eval_strat = y_test.loc[X_test[stratify_on] == cat]
 
             start = time.time()
             y_pred = predict_proba_batched(tuned_model, X_eval_strat)
@@ -1436,17 +1788,20 @@ def train_evaluate(model_name, model, X_train, y_train, df_test, stratify_on="ge
     try:
         logits = special.logit(y_pred)
         calib_model = LogisticRegression(penalty=None, max_iter=500)
-        calib_model.fit(logits.reshape(-1, 1),df_test["hospital_mortality"])
+        calib_model.fit(logits.reshape(-1, 1),y_test)
         intercept, slope = calib_model.intercept_[0], calib_model.coef_[0][0]
     except Exception as e:
         error_msg = traceback.format_exc()
 
-    prob_true, prob_pred = calibration_curve(df_test["hospital_mortality"], y_pred)
+    prob_true, prob_pred = calibration_curve(y_test, y_pred)
+
+    del tuned_model, calibrated_clf
+    gc.collect()
 
     return (
         model_name,
-        roc_auc_score(y_score=y_pred, y_true=df_test["hospital_mortality"]),
-        brier_score_loss(y_true=df_test["hospital_mortality"], y_proba=y_pred),
+        roc_auc_score(y_score=y_pred, y_true=y_test),
+        brier_score_loss(y_true=y_test, y_proba=y_pred),
         intercept,
         slope,
         prob_true,
@@ -1454,7 +1809,6 @@ def train_evaluate(model_name, model, X_train, y_train, df_test, stratify_on="ge
         train_fit_time,
         test_pred_time,
     )
-
 
 results_m4_gender = Parallel(n_jobs=NJOBS, verbose=0)(
     delayed(train_evaluate)(model_name, model, X, y, mimic_4, stratify_on=variable)
@@ -1572,7 +1926,6 @@ save_results(
     test_name="MIMIC_4_YEAR",
 )
 
-
 results_m4 = Parallel(n_jobs=NJOBS, verbose=0)(
     delayed(train_evaluate)(model_name, model, X, y, mimic_4, stratify_on=None)
     for model_name, model in models.items()
@@ -1583,268 +1936,3 @@ results_m4_df.to_csv(directory + "m4.csv")
 
 
 print("SUBGROUP NOISE OVER")
-
-"""### Missing data
-
-"""
-
-directory = f"{directory_name}/missing_data/"
-create_directory(directory)
-
-missing_ratio = np.linspace(0.1, 1, 9, endpoint=False)
-
-def add_missingness(X_noisy, noise_level, mechanism="MCAR", prop_cond_features=0.5):
-    size = X_noisy.shape
-    mask = None
-
-    if mechanism == "MCAR":
-        mask = np.random.rand(*size) < noise_level
-
-    elif mechanism == "MAR":
-        X_float = X_noisy.astype(np.float32).values
-        # can't create rng here because we need caller's seed to be used; caller
-        # should call MAR_mask directly with rng/torch_gen when determinism is
-        # required. For backwards compatibility, fall back to MAR_mask default.
-        mask = MAR_mask(X_float, p=noise_level, p_obs=prop_cond_features)
-
-    elif mechanism == "MNAR":
-        X_float = X_noisy.astype(np.float32).values
-        mask = MNAR_self_mask_logistic(X_float, noise_level)
-
-    if mask is None: 
-        print("DEBUG : EMPTY MASK") 
-    return mask
-
-
-def missing_data(
-    model_name,
-    model,
-    noise_level,
-    train_idx,
-    val_idx,
-    fold_idx,
-    which_set="Train",
-    mechanism="MNAR",
-):
-
-    X_train, X_val = X.loc[train_idx], X.loc[val_idx]
-    y_train, y_val = y.loc[train_idx], y.loc[val_idx]
-
-
-    if N_TRAINING_SAMPLE > 0:
-        n_samples = np.min([len(X_train), N_TRAINING_SAMPLE])
-        idx = X_train.sample(n_samples, random_state=RANDOM_STATE).index
-        X_train  = X_train.loc[idx] 
-        y_train = y_train.loc[idx]
-
-    set_random_seed(which_set+mechanism, noise_level, fold_idx, base_seed=RANDOM_STATE)
-
-    if which_set == "Train":
-        #if not(model_name == "TabICL" or mechanism == "MAR") and noise_level >= 0.6 :
-        #    print(f"Skipping {model_name} with noise level {noise_level} as it is too high for TabPfn")
-        #    return (
-        #        model_name,
-        #        noise_level,
-        #        None,
-        #        None,
-        #        [None] * 5,
-        #        [None] * 5,
-        #        None,
-        #        None
-        #    )       
-        X_noisy = X_train
-        X_noisy[cont_features] = X_noisy[cont_features].fillna(X_train[cont_features].mean()) ## imputation is required to create the MAR and MNAR masks
-        X_noisy[cat_features] = X_noisy[cat_features].fillna(X_train[cat_features].mode().loc[0])
-        seed = set_random_seed(which_set+mechanism, noise_level, fold_idx, base_seed=RANDOM_STATE)
-        rng = np.random.default_rng(seed)
-        torch_gen = torch.Generator()
-        torch_gen.manual_seed(seed)
-        size = X_noisy.shape
-        mask = (
-            MAR_mask(X_noisy.astype(np.float32).values, p=noise_level, p_obs=0.5, rng=rng, torch_gen=torch_gen)
-            if mechanism == "MAR"
-            else (MNAR_self_mask_logistic(X_noisy.astype(np.float32).values, noise_level, rng=rng, torch_gen=torch_gen) if mechanism == "MNAR" else (rng.random(size) < noise_level))
-        )
-        X_train = X_noisy.mask(mask, np.nan)
-    if which_set == "Val":
-        X_noisy = X_val
-        X_noisy[cont_features] = X_noisy[cont_features].fillna(X_train[cont_features].mean()) ## imputation is required to create the MAR and MNAR masks
-        X_noisy[cat_features] = X_noisy[cat_features].fillna(X_train[cat_features].mode().loc[0])
-        seed = set_random_seed(which_set+mechanism, noise_level, fold_idx, base_seed=RANDOM_STATE)
-        rng = np.random.default_rng(seed)
-        torch_gen = torch.Generator()
-        torch_gen.manual_seed(seed)
-        size = X_noisy.shape
-        mask = (
-            MAR_mask(X_noisy.astype(np.float32).values, p=noise_level, p_obs=0.5, rng=rng, torch_gen=torch_gen)
-            if mechanism == "MAR"
-            else (MNAR_self_mask_logistic(X_noisy.astype(np.float32).values, noise_level, rng=rng, torch_gen=torch_gen) if mechanism == "MNAR" else (rng.random(size) < noise_level))
-        )
-        X_val = X_noisy.mask(mask, np.nan)
-    if which_set == "Train_Val":
-        #if not(model_name == "TabICL" or mechanism == "MAR") and noise_level >= 0.6 :
-        #    print(f"Skipping {model_name} with noise level {noise_level} as it is too high for TabPfn")
-        #    return (
-        #        model_name,
-        #        noise_level,
-        #        None,
-        #        None,
-        #        [None] * 5,
-        #        [None] * 5,
-        #        None,
-        #        None
-        #    )   
-        subsample_train_idx  = X_train.index
-
-        X_noisy = pd.concat([X_train, X_val])
-        X_noisy[cont_features] = X_noisy[cont_features].fillna(X_train[cont_features].mean()) ## imputation is required to create the MAR and MNAR masks
-        X_noisy[cat_features] = X_noisy[cat_features].fillna(X_train[cat_features].mode().loc[0])
-        seed = set_random_seed(which_set+mechanism, noise_level, fold_idx, base_seed=RANDOM_STATE)
-        rng = np.random.default_rng(seed)
-        torch_gen = torch.Generator()
-        torch_gen.manual_seed(seed)
-        size = X_noisy.shape
-        mask = (
-            MAR_mask(X_noisy.astype(np.float32).values, p=noise_level, p_obs=0.5, rng=rng, torch_gen=torch_gen)
-            if mechanism == "MAR"
-            else (MNAR_self_mask_logistic(X_noisy.astype(np.float32).values, noise_level, rng=rng, torch_gen=torch_gen) if mechanism == "MNAR" else (rng.random(size) < noise_level))
-        )
-        X_all = X_noisy.mask(mask, np.nan)
-        X_train, X_val = X_all.loc[subsample_train_idx], X_all.loc[val_idx] 
-
-
-    start = time.time()
-    #print(f"Debug {model_name}, {model}, {noise_level}")
-    tuned_model, best_params = tune_model(model_name, model, X_train, y_train, random_state=seed)
-    end = time.time()
-    train_fit_time = end - start
-
-    start = time.time()
-    y_pred = predict_proba_batched(tuned_model, X_val)
-    end = time.time()
-    test_pred_time = end - start
-
-    gc.collect() 
-
-    ## calibration slope/intercept
-    intercept, slope = None, None
-    try:
-        logits = special.logit(y_pred)
-        calib_model = LogisticRegression(penalty=None, max_iter=500)
-        calib_model.fit(logits.reshape(-1, 1),y_val)
-        intercept, slope = calib_model.intercept_[0], calib_model.coef_[0][0]
-    except Exception as e:
-        error_msg = traceback.format_exc()
-
-    prob_true, prob_pred = calibration_curve(y_val, y_pred)
-
-    return (
-        model_name,
-        noise_level,
-        roc_auc_score(y_score=y_pred, y_true=y_val),
-        brier_score_loss(y_true=y_val, y_proba=y_pred),
-        intercept,
-        slope,
-        prob_true,
-        prob_pred,
-        train_fit_time,
-        test_pred_time,
-        best_params
-    )
-
-results_MCAR_train = Parallel(n_jobs=NJOBS, verbose=1)(
-    delayed(missing_data)(
-        model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Train", mechanism="MCAR"
-    )
-    for model_name, model in models.items()
-    for ratio in missing_ratio
-    for fold_idx, (train_idx, val_idx) in enumerate(splits)
-)
-
-save_results(results_MCAR_train, directory, n_folds, test_name="MCAR_TRAIN")
-
-results_MCAR_val = Parallel(n_jobs=NJOBS, verbose=1)(
-    delayed(missing_data)(model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Val", mechanism="MCAR")
-    for model_name, model in models.items()
-    for ratio in missing_ratio
-    for fold_idx, (train_idx, val_idx) in enumerate(splits)
-)
-
-save_results(results_MCAR_val, directory, n_folds, test_name="MCAR_VAL")
-
-results_MCAR_all = Parallel(n_jobs=NJOBS, verbose=1)(
-    delayed(missing_data)(
-        model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Train_Val", mechanism="MCAR"
-    )
-    for model_name, model in models.items()
-    for ratio in missing_ratio
-    for fold_idx, (train_idx, val_idx) in enumerate(splits)
-)
-
-save_results(results_MCAR_all, directory, n_folds, test_name="MCAR_ALL")
-
-
-results_MAR_train = Parallel(n_jobs=NJOBS, verbose=1)(
-    delayed(missing_data)(
-        model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Train", mechanism="MAR"
-    )
-    for model_name, model in models.items()
-    for ratio in missing_ratio
-    for fold_idx, (train_idx, val_idx) in enumerate(splits)
-)
-
-save_results(results_MAR_train, directory, n_folds, test_name="MAR_TRAIN")
-
-results_MAR_val = Parallel(n_jobs=NJOBS, verbose=1)(
-    delayed(missing_data)(model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Val", mechanism="MAR")
-    for model_name, model in models.items()
-    for ratio in missing_ratio
-    for fold_idx, (train_idx, val_idx) in enumerate(splits)
-)
-
-save_results(results_MAR_val, directory, n_folds, test_name="MAR_VAL")
-
-results_MAR_all = Parallel(n_jobs=NJOBS, verbose=1)(
-    delayed(missing_data)(
-        model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Train_Val", mechanism="MAR"
-        )
-    for model_name, model in models.items()
-    for ratio in missing_ratio
-    for fold_idx, (train_idx, val_idx) in enumerate(splits)
-)
-
-save_results(results_MAR_all, directory, n_folds, test_name="MAR_ALL")
-
-results_MNAR_train = Parallel(n_jobs=NJOBS, verbose=1)(
-    delayed(missing_data)(
-        model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Train"
-    )
-    for model_name, model in models.items()
-    for ratio in missing_ratio
-    for fold_idx, (train_idx, val_idx) in enumerate(splits)
-)
-
-save_results(results_MNAR_train, directory, n_folds, test_name="MNAR_TRAIN")
-
-results_MNAR_val = Parallel(n_jobs=NJOBS, verbose=1)(
-    delayed(missing_data)(model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Val")
-    for model_name, model in models.items()
-    for ratio in missing_ratio
-    for fold_idx, (train_idx, val_idx) in enumerate(splits)
-)
-
-save_results(results_MNAR_val, directory, n_folds, test_name="MNAR_VAL")
-
-results_MNAR_all = Parallel(n_jobs=NJOBS, verbose=1)(
-    delayed(missing_data)(
-        model_name, model, ratio, train_idx, val_idx, fold_idx, which_set="Train_Val",
-        )
-    for model_name, model in models.items()
-    for ratio in missing_ratio
-    for fold_idx, (train_idx, val_idx) in enumerate(splits)
-)
-
-save_results(results_MNAR_all, directory, n_folds, test_name="MNAR_ALL")
-
-
-print("MISSING DATA OVER")

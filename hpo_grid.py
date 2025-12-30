@@ -107,6 +107,7 @@ PARAM_GRIDS = {
         'mlp__early_stopping':[True],
         'mlp__validation_fraction':[0.1],
         'mlp__n_iter_no_change':[50],
+        'mlp__max_iter':[500],
     }
 
 }

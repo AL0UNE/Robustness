@@ -387,7 +387,9 @@ def tune_model(model_name, model, X_train, y_train, random_state=None):
     else:
         keys, values = zip(*param_dist.items())
         param_grid = [dict(zip(keys, v)) for v in itertools.product(*values)]
+        ## non-deterministic selection of hyperparameters to try
         param_idx = np.random.choice(len(param_grid), size=N_SEARCH_GS, replace=False)
+        
         best_auc = -np.inf
         best_model = None
         best_params = None
@@ -631,7 +633,7 @@ def label_noise(
         best_params
     )
 
-
+'''
 # Safeguard
 directory = f"{directory_name}/label_noise/"
 create_directory(directory)
@@ -697,6 +699,7 @@ save_results(results_label_noise_proxy, directory, n_folds, test_name="PROXY_LAB
 
 
 print("LABEL NOISE OVER")
+'''
 
 """### Measurement noise
 
